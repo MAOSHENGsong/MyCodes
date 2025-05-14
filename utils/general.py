@@ -1370,3 +1370,60 @@ def increment_path(path, exist_ok=False, sep='', mkdir=False):
     if not dir.exists() and mkdir:
         dir.mkdir(parents=True, exist_ok=True)  # 递归创建目录
     return path
+
+def user_config_dir(dir='Ultralytics', env_var='YOLOV5_CONFIG_DIR'):
+    """
+    获取跨平台用户配置目录路径，优先使用环境变量指定路径。
+    核心功能：
+    - 环境变量优先：若env_var存在则直接使用
+    - 智能回退机制：识别操作系统类型选择默认配置路径，不可写时降级至/tmp目录
+    - 自动创建目录：确保返回路径存在
+    特殊处理：适配云服务环境(GCP/AWS Lambda)，仅/tmp目录可写时自动切换
+    """
+    # Return path of user configuration directory. Prefer environment variable if exists. Make dir if required.
+    env = os.getenv(env_var)
+    if env:
+        path = Path(env)  # use environment variable
+    else:
+        cfg = {'Windows': 'AppData/Roaming', 'Linux': '.config', 'Darwin': 'Library/Application Support'}  # 3 OS dirs
+        path = Path.home() / cfg.get(platform.system(), '')  # OS-specific config dir
+        path = (path if is_writeable(path) else Path('/tmp')) / dir  # GCP and AWS lambda fix, only /tmp is writeable
+    path.mkdir(exist_ok=True)  # make if required
+    return path
+
+def is_writeable(dir, test=False):
+    """
+    检查目录是否具有写入权限，提供两种检测模式。
+
+    核心功能：
+    - 快速权限检查：默认使用os.access进行基础权限验证(可能不适用于复杂权限系统)
+    - 真实写入测试：当test=True时创建临时文件验证实际写入能力
+
+    参数说明：
+    dir: 待检测目录路径
+    test: 是否执行真实文件操作测试(更可靠但会产生IO操作)
+
+    实现方法：
+    - 方法1(test=True): 创建临时文件并删除，捕获IOError判断实际写入能力
+    - 方法2(默认): 使用os.access的R_OK标志进行快速读取权限验证(Windows系统可能存在偏差)
+    """
+    if test:  # 真实写入测试模式
+        file = Path(dir) / 'tmp.txt'
+        try:
+            with open(file, 'w'):  # 尝试创建可写文件
+                pass
+            file.unlink()  # 清理测试文件
+            return True
+        except IOError:  # 捕获写入异常
+            return False
+    else:  # 快速权限检查模式
+        return os.access(dir, os.R_OK)  # 注意：Windows的ACL权限可能导致检测不准确
+
+def is_ascii(s=''):
+    # Is string composed of all ASCII (no UTF) characters? (note str().isascii() introduced in python 3.7)
+    s = str(s)  # convert list, tuple, None, etc. to str
+    return len(s.encode().decode('ascii', 'ignore')) == len(s)
+
+def is_chinese(s='人工智能'):
+    # Is string composed of any Chinese characters?
+    return re.search('[\u4e00-\u9fff]', s)
