@@ -1427,3 +1427,19 @@ def is_ascii(s=''):
 def is_chinese(s='人工智能'):
     # Is string composed of any Chinese characters?
     return re.search('[\u4e00-\u9fff]', s)
+
+
+def clean_str(s):
+    """🧼 字符串清洗函数，规范化特殊字符为下划线
+
+    核心功能:
+        - 使用正则表达式替换非法字符:
+          替换 |@#!¡·$€%&()=?¿^*;:,¨´><+ 等符号为 _
+        - 保留字母数字及常规符号
+
+    注意:
+        - 不处理空格、中文标点等其他特殊字符
+        - 保留原始字符串的大小写格式
+        - 连续多个特殊字符会被替换为单个_
+    """
+    return re.sub(pattern="[|@#!¡·$€%&()=?¿^*;:,¨´><+]", repl="_", string=s)
