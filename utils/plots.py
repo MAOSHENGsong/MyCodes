@@ -12,7 +12,7 @@ import seaborn as sn
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from utils.general import user_config_dir, is_ascii, is_chinese, xywh2xyxy
+from utils.general import user_config_dir, is_ascii, is_chinese, xywh2xyxy, xyxy2xywh
 
 # Settings
 CONFIG_DIR = user_config_dir()  # Ultralytics设置目录
@@ -707,3 +707,37 @@ def plot_labels(labels, names=(), save_dir=Path('')):
     plt.savefig(save_dir / 'labels.jpg', dpi=200)
     matplotlib.use('Agg')  # 切换回非GUI后端
     plt.close()
+
+
+def output_to_target_ssod(output):
+    """
+    将模型输出转换为结构化目标格式
+    功能：重组检测结果数据，整合批次信息与坐标转换
+
+    参数：
+    output - 模型原始输出列表，每个元素为单张图像的检测结果张量
+
+    返回：
+    np.array 结构化为[batch_id, class_id, x_center, y_center, width, height, conf, obj_conf, cls_conf]的二维数组
+
+    处理流程：
+    1. 遍历每张图像的检测结果
+    2. 解包边界框坐标及各类置信度
+    3. 坐标格式转换(xyxy→xywh)
+    4. 组织为包含元数据的结构化数组
+
+    注意：
+    - 包含目标置信度(obj_conf)和分类置信度(cls_conf)双置信度信息
+    - 使用xywh归一化坐标格式，适用于多数检测任务后续处理
+    - 保留原始张量设备信息(cpu转换)避免GPU内存问题
+    """
+    targets = []
+    # 遍历批次中每张图像的检测结果
+    for i, o in enumerate(output):
+        # 解包每个检测结果：边界框坐标、总置信度、类别、目标置信度、分类置信度
+        for *box, conf, cls, obj_conf, cls_conf in o.cpu().numpy():
+            # 坐标格式转换 (x1,y1,x2,y2) → (x_center,y_center,width,height)
+            xywh_coords = list(*xyxy2xywh(np.array(box)[None]))  # 保持二维结构处理单检测框
+            # 组织数据结构：批次ID, 类别, 坐标, 各置信度
+            targets.append([i, cls, *xywh_coords, conf, obj_conf, cls_conf])
+    return np.array(targets)
