@@ -1,9 +1,13 @@
+import logging
+
 from torch import nn
 
+from utils.torch_utils import initialize_weights
 from yolo_models.backbone import build_backbone
 from yolo_models.head import build_head
 from yolo_models.neck import build_neck
 
+LOGGER = logging.getLogger(__name__)
 
 class Model(nn.Module):
     """

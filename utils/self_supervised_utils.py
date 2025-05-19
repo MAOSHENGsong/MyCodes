@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 from utils.general import xyxy2xywh, xywh2xyxy, non_max_suppression, segment2box, resample_segments
 from utils.general import non_max_suppression_ssod
+from utils.metrics import box_iou
 from utils.plots import plot_images_ssod, plot_images, output_to_target_ssod
 import copy
 
@@ -548,3 +549,158 @@ def online_label_transform(img, targets, M, s, segments=(), border=(0, 0), persp
         targets[:, 1:5] = new[i]  # 更新坐标数据
 
     return img, targets
+
+def check_pseudo_label_with_gt(detections, labels, iouv=torch.tensor([0.5]), ignore_thres_low=None, ignore_thres_high=None, batch_size=1):
+    """
+    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
+    Arguments:
+        detections (Array[N, 6]), x1, y1, x2, y2, conf, class
+        labels (Array[M, 5]), class, x1, y1, x2, y2
+    Returns:
+        correct (Array[N, 10]), for 10 IoU levels
+    """
+    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    tp_num = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    fp_cls_num = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    fp_loc_num = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    gt = labels[:, 2:6]
+    # print('labels shape:', labels.shape)
+    if ignore_thres_low is not None:
+        # print('thres_high:', ignore_thres_high)
+        # print('thres_low:', ignore_thres_low)
+        detections, uc_pseudo = select_targets(detections, ignore_thres_low, ignore_thres_high)
+        # pseudo = detections[detections[:, 6] > ignore_thres]
+        # print('pseudo:', detections)
+        # print('uc_pseudo:', uc_pseudo)
+        # detections = torch.cat((detections, uc_pseudo))
+        detections = uc_pseudo
+        pseudo = detections[:, 2:6]
+        pseudo_label_num = pseudo.shape[0] / batch_size
+        # pseudo_label_num = detections.shape[0]
+        gt_label_num = gt.shape[0]/batch_size
+    else:
+        pseudo = detections[:, 2:6]
+        pseudo_label_num = detections.shape[0]
+        pseudo_label_num /= batch_size
+        gt_label_num = gt.shape[0]/batch_size
+
+    gt *= torch.tensor([640, 640] * 2)
+    pseudo *= torch.tensor([640, 640] * 2)
+    gt = xywh2xyxy(gt) + labels[:, 0:1] * torch.tensor([640, 640] * 2)
+    pseudo = xywh2xyxy(pseudo) + detections[:, 0][:, None] * torch.tensor([640, 640] * 2)
+    # print(gt)
+    # print(pseudo)
+    # print(labels[:, 0:1][:,None].shape)
+    iou = box_iou(gt, pseudo)
+    # print('iou:', iou)
+    # print('iou shape', iou.shape)
+    correct_class = labels[:, 1:2] == detections[:, 1]
+    correct_image = labels[:, 0:1] == detections[:, 0]
+    # print('correct_class:', correct_class)
+
+    for i in range(len(iouv)):
+        # print('correct_image:', correct_image)
+        # print('correct_class:', correct_class)
+        # print('iou:', (iou < iouv[i]) & (iou > torch.tensor(0.1)))
+        tp_x = torch.where((iou >= iouv[i]) & correct_class & correct_image)  # IoU > threshold and classes match
+        fp_cls_x = torch.where((iou >= iouv[i]) & ~correct_class & correct_image)  # IoU > threshold and classes match
+        # fp_loc_x = torch.where((iou < iouv[i]) & (iou > torch.tensor(0.1)) & correct_class & correct_image)  # IoU > threshold and classes match
+        fp_loc_x = torch.where((iou < iouv[i]) & (iou > torch.tensor(0.01)) & correct_image)  # IoU > threshold and classes match
+        # print('fp_loc_x:', fp_loc_x.shape)
+        # print('fp_cls_x:', fp_cls_x.shape)
+        # print(iou.shape, correct_image.shape, correct_class.shape)
+        # fp_both_x = torch.where((iou < iouv[i]) & correct_image & ~correct_class)  # IoU > threshold and classes match
+        # print('x:', x)
+        # print(torch.where(iou >= iouv[i]))
+        if tp_x[0].shape[0]:
+            matches = torch.cat((torch.stack(tp_x, 1), iou[tp_x[0], tp_x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+            if tp_x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                # matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+            tp_num[matches[:, 1].astype(int), i] = True
+        if fp_cls_x[0].shape[0]:
+            matches = torch.cat((torch.stack(fp_cls_x, 1), iou[fp_cls_x[0], fp_cls_x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+            if fp_cls_x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                # matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+            fp_cls_num[matches[:, 1].astype(int), i] = True
+        if fp_loc_x[0].shape[0]:
+            matches = torch.cat((torch.stack(fp_loc_x, 1), iou[fp_loc_x[0], fp_loc_x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+            if fp_loc_x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                # matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+            fp_loc_num[matches[:, 1].astype(int), i] = True
+    if detections.shape[0] == 0:
+        tp_rate = 0
+        fp_cls_rate = 0
+        fp_loc_rate = 0
+    else:
+        tp_rate = np.sum(tp_num, 0) * 1.0/ detections.shape[0]
+        fp_cls_rate = np.sum(fp_cls_num, 0) * 1.0/ detections.shape[0]
+        fp_loc_rate = np.sum(fp_loc_num, 0) * 1.0/ detections.shape[0]
+    # print('tp_rate:', tp_rate, tp_num)
+    # print('fp_cls_rate:', fp_cls_rate, np.sum(fp_cls_num, 0))
+    # print('fp_loc_rate:', fp_loc_rate, fp_loc_num, detections.shape[0])
+    # iou_recall_rate = np.sum(correct, 0) * 1.0/ labels.shape[0]
+    # print('correct:', np.sum(correct, 0))
+    # if ignore_thres_low is not None:
+    # hit_rate = detections.shape[0] * 1.0 / labels.shape[0]
+    # print('correct shape:', correct.shape)
+    # print(np.sum(correct, 1))
+    # print(detections.shape[0])
+    return tp_rate, fp_cls_rate, fp_loc_rate, pseudo_label_num, gt_label_num
+
+def check_pseudo_label(detections, ignore_thres_low=None, ignore_thres_high=None, batch_size=1):
+    """
+    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
+    Arguments:
+        detections (Array[N, 6]), x1, y1, x2, y2, conf, class
+        labels (Array[M, 5]), class, x1, y1, x2, y2
+    Returns:
+        correct (Array[N, 10]), for 10 IoU levels
+    """
+    # print('ignore_thres_high:', ignore_thres_high, ' ignore_thres_low:', ignore_thres_low)
+    reliable_pseudo, uc_pseudo = select_targets(detections, ignore_thres_low, ignore_thres_high)
+    reliable_num = reliable_pseudo.shape[0]/batch_size
+    uncertain_num = uc_pseudo.shape[0]/batch_size
+    denorm = reliable_num + uncertain_num
+    if denorm == 0:
+        precision_rate = 0
+    else:
+        precision_rate = reliable_num/ denorm
+    if detections.shape[0] == 0:
+        recall_rate = 0
+    else:
+        recall_rate = (reliable_num + uncertain_num) * batch_size / detections.shape[0]
+    return precision_rate, recall_rate, reliable_num + uncertain_num, reliable_num
+
+def select_targets(targets, ignore_thres_low, ignore_thres_high):
+    device = targets.device
+    certain_targets = []
+    uncertain_targets = []
+    for t in targets:
+        # 伪标签得分大于相应类别的阈值,标记为正样本
+        if t[6] >= ignore_thres_high[int(t[1])]:
+            certain_targets.append(np.array(t.cpu()))
+        # 伪标签在0.1到阈值去之前的，标记为忽略样本
+        elif t[6] >= ignore_thres_low[int(t[1])]:
+            uncertain_targets.append(np.array(t.cpu()))
+
+    certain_targets = np.array(certain_targets).astype(np.float32)
+    certain_targets = torch.from_numpy(certain_targets).contiguous()
+    certain_targets = certain_targets.to(device)
+    if certain_targets.shape[0] == 0:
+        certain_targets = torch.tensor([0, 1, 2, 3, 4, 5, 6])[False].to(device)
+
+    uncertain_targets = np.array(uncertain_targets).astype(np.float32)
+    uncertain_targets = torch.from_numpy(uncertain_targets).contiguous()
+    uncertain_targets = uncertain_targets.to(device)
+    if uncertain_targets.shape[0] == 0:
+        uncertain_targets = torch.tensor([0, 1, 2, 3, 4, 5, 6])[False].to(device)
+    return certain_targets, uncertain_targets

@@ -15,11 +15,14 @@ from contextlib import redirect_stdout
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
 from utils.downloads import attempt_download
-from utils.general import colorstr, check_img_size, check_suffix, methods, init_seeds
+from utils.general import colorstr, check_img_size, check_suffix, methods, init_seeds, one_cycle, \
+    labels_to_class_weights
 from utils.loggers import Loggers
 from utils.metrics import fitness, MetricMeter
 from utils.plots import plot_labels
 from utils.torch_utils import torch_distributed_zero_first, intersect_dicts, ModelEMA, is_parallel, de_parallel
+from yolo_models.detector.yolo import Model
+from yolo_models.loss.loss import ComputeLoss, ComputeFastXLoss, ComputeNanoLoss
 
 LOGGER = logging.getLogger(__name__)
 
@@ -373,7 +376,7 @@ class Trainer:
             self.optimizer.add_param_group({'params': g_w, 'weight_decay': weight_decay})
             self.optimizer.add_param_group({'params': g_bnw})
         else:  # 结构重参数优化器
-            from models.optimizers.RepOptimizer import RepVGGOptimizer
+            from yolo_models.optimizers import RepVGGOptimizer
             assert cfg.Model.RepScale_weight, "RepOptimizer需要指定缩放权重文件"
             scales = self.opt_scales or torch.load(cfg.Model.RepScale_weight, self.device)
             params_groups = [
