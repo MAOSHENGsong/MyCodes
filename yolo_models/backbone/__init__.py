@@ -5,7 +5,7 @@ def build_backbone(cfg):
     backbone_cfg = copy.deepcopy(cfg)
     # name = backbone_cfg.pop("name")
     name = backbone_cfg.Model.Backbone.name
-    if name == "YoloV11":
-        return YoloV11BackBone(backbone_cfg)
+    if name == "YoLov11":
+        return YOLOv11Backbone(backbone_cfg)
     else:
         raise NotImplementedError

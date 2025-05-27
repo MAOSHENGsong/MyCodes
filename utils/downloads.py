@@ -80,7 +80,7 @@ def attempt_download(file, repo='AlibabaResearch/efficientteacher'):  # from uti
             - 包含注释掉的google storage备用下载源
             - 通过min_bytes=1E5(约100KB)验证文件有效性
         """
-    file = Path(str(file).strip().replace("'", ''))
+    file = Path(str(file).strip().replace("'", '')) # 去除两端空白，删除所有单引号
 
     if not file.exists():
         # URL specified

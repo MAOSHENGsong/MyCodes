@@ -1,9 +1,11 @@
 import logging
 
+import torch
 from torch import nn
 
-from utils.torch_utils import initialize_weights
-from yolo_models.backbone import build_backbone
+from utils.torch_utils import initialize_weights, fuse_conv_and_bn, copy_attr, model_info
+from yolo_models.backbone import build_backbone, Conv
+from yolo_models.backbone.common import AutoShape
 from yolo_models.head import build_head
 from yolo_models.neck import build_neck
 
@@ -43,13 +45,36 @@ class Model(nn.Module):
         LOGGER.info('')  # 输出空行分隔日志
 
     def check_head(self):
+        """ YOLOv11检测头专项配置检查与初始化
+
+        功能说明:
+        - 计算特征图下采样步长(stride)
+        - 初始化检测层偏置参数
+
+        流程说明:
+        1. 获取检测头实例并标记模型类型
+        2. 配置原地操作(inplace)参数
+        3. 计算特征图下采样步长
+        4. 执行偏置参数初始化
         """
-        验证检测头结构的有效性：
-        - 确保head中的anchor尺寸与特征图匹配
-        - 检查分类数配置一致性
-        - 验证输出层的通道数计算
-        """
-        # 实现细节包含通道数匹配验证、anchor尺寸校验等
+        m = self.head  # 获取YOLOv11Detect检测头实例
+        self.model_type = 'yolov11'  # 明确标记模型类型
+
+        # 配置原地操作优化内存使用
+        m.inplace = self.inplace
+
+        # 动态计算各检测层步长
+        s = 640  # 基准输入尺寸（建议使用训练时标准输入尺寸）
+        with torch.no_grad():
+            # 生成虚拟输入: (batch, channels, height, width)
+            test_input = torch.zeros(1, self.cfg.Model.ch, s, s)
+            # 获取各层输出特征图的尺寸 [1, C, H, W]
+            feature_shapes = [x.shape for x in self.forward(test_input)]
+            # 计算实际步长 = 输入尺寸 / 特征图尺寸
+            self.stride = torch.Tensor([s / x.shape[-2] for x in feature_shapes])
+
+        # 初始化检测层偏置参数（YOLOv11专用初始化逻辑）
+        m.initialize_biases(self.stride)  # 传入步长参数用于自适应初始化
 
 
     def forward(self, x):
@@ -64,6 +89,47 @@ class Model(nn.Module):
         x = self.neck(x)
         return self.head(x)
 
+    # def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
+    #     LOGGER.info('Fusing layers... ')
+    #     for m in self.backbone.modules():
+    #         if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+    #             m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+    #             delattr(m, 'bn')  # remove batchnorm
+    #             m.forward = m.forward_fuse  # update forward
+    #
+    #     for m in self.neck.modules():
+    #         if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+    #             m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+    #             delattr(m, 'bn')  # remove batchnorm
+    #             m.forward = m.forward_fuse  # update forward
+    #
+    #     for layer in self.backbone.modules():
+    #         if isinstance(layer, QARepVGGBlock):
+    #             layer.switch_to_deploy()
+    #         if isinstance(layer, RepVGGBlock):
+    #             layer.switch_to_deploy()
+    #         if isinstance(layer, RepConv):
+    #             layer.fuse_repvgg_block()
+    #         if hasattr(layer, 'reparameterize'):
+    #             layer.reparameterize()
+    #     for layer in self.neck.modules():
+    #         if isinstance(layer, QARepVGGBlock):
+    #             layer.switch_to_deploy()
+    #         if isinstance(layer, RepVGGBlock):
+    #             layer.switch_to_deploy()
+    #         if isinstance(layer, RepConv):
+    #             layer.fuse_repvgg_block()
+    #         if hasattr(layer, 'reparameterize'):
+    #             layer.reparameterize()
+    #     self.info()
+    #     return self
+
+    def autoshape(self):  # add AutoShape module
+        LOGGER.info('Adding AutoShape... ')
+        m = AutoShape(self)  # wrap model
+        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
+        return m
+
     @property
     def device(self):
         """ 自动获取模型所在设备（CPU/GPU） """
@@ -76,7 +142,6 @@ class Model(nn.Module):
         self.backbone.inplace = self.inplace
         return self
 
-    def info(self, verbose=False):
+    def info(self, verbose=False,img_size=416):
         """ 输出模型结构信息 """
-        # 包含参数量计算、各组件结构打印等
-        ...
+        model_info(self, verbose, img_size)

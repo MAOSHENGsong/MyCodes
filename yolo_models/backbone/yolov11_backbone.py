@@ -2,10 +2,8 @@ import logging
 import sys
 from pathlib import Path
 
-from torch import nn
-from ultralytics.utils.ops import make_divisible
-
-from yolo_models.backbone.common import Conv, C3, SPPF, C3k2
+from utils.general import make_divisible
+from yolo_models.backbone.common import Conv, C3, SPPF, C3k2, C2PSA
 
 FILE = Path(__file__).resolve()  # 获取当前文件的绝对路径
 ROOT = FILE.parents[1]          # 获取项目根目录（上两级目录）
@@ -27,7 +25,7 @@ class YOLOv11Backbone(nn.Module):
     基于yolo11.yaml配置文件构建，包含特征提取核心组件
 
     特性:
-        - 多尺度特征提取(P3/8, P4/16, P5/32)
+        - 多尺度特征提取
         - 动态深度/宽度缩放
         - 集成注意力机制模块
         - 优化SPPF金字塔池化结构
@@ -50,7 +48,7 @@ class YOLOv11Backbone(nn.Module):
             'stage3': 256,  # P3/8阶段
             'stage4': 512,  # P4/16阶段
             'stage5': 1024,  # P5/32阶段
-            'spp': 1024,  # SPPF输出
+            'sppf': 1024,  # SPPF输出
             'c2psa': 1024  # 注意力模块输出
         }
         self._adjust_channels(base_channels)  # 动态调整通道数
@@ -117,7 +115,7 @@ class YOLOv11Backbone(nn.Module):
 
         # ----------------- 特征增强模块 -----------------
         layers['sppf'] = SPPF(
-            self.base_channels['stage5'], self.base_channels['spp'], k=5
+            self.base_channels['stage5'], self.base_channels['sppf'], k=5
         )
         layers['c2psa'] = C2PSA(
             self.base_channels['spp'], self.base_channels['c2psa'],

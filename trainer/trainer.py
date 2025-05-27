@@ -27,18 +27,15 @@ from yolo_models.loss.loss import ComputeLoss, ComputeFastXLoss, ComputeNanoLoss
 LOGGER = logging.getLogger(__name__)
 
 class Trainer:
-    def __init__(self, cfg, device, callbacks, LOCAL_RANK, RANK, WORLD_SIZE):
+    def __init__(self, cfg, device, callbacks):
         """
         训练流程管理类
 
         功能说明:
-        - 集成训练环境初始化、模型构建、优化器配置、数据加载和分布式训练等功能
-        - 支持多GPU/分布式训练场景 (通过DDP实现)
-        - 提供训练过程监控和回调支持
+        - 集成训练环境初始化、模型构建、优化器配置、数据加载等功能
 
         重点细节:
         - 参数边界条件:
-          * LOCAL_RANK/RANK/WORLD_SIZE: 分布式训练参数，单机训练时建议设置为-1/0/1
           * device: 需为有效计算设备 (如torch.device('cuda')或torch.device('cpu'))
           * cfg: 必须包含模型结构、超参数、数据路径等完整配置
 
@@ -70,8 +67,8 @@ class Trainer:
         """
         self.cfg = cfg
 
-        # 环境初始化 (分布式配置/路径设置/日志系统)
-        self.set_env(cfg, device, LOCAL_RANK, RANK, WORLD_SIZE, callbacks)
+        # 环境初始化
+        self.set_env(cfg, device)
 
         # 模型构建与优化器初始化
         self.opt_scales = None  # 混合精度训练缩放因子
@@ -195,67 +192,27 @@ class Trainer:
     def build_model(self, cfg, device):
         """
         构建并初始化模型架构
-
-        功能说明:
-        - 根据配置加载或创建模型
-        - 处理预训练权重加载与参数匹配
-        - 实现模型参数冻结策略
-        - 初始化模型EMA(指数移动平均)
-        - 支持训练恢复与迁移学习
-
-        重点细节:
-        - 参数边界条件:
-          * cfg.weights: 必须为有效的.pt文件路径或预训练模型标识
-          * cfg.freeze_layer_num: 冻结层数需小于模型总层数
-          * device: 必须与后续训练设备一致
-
-        - 关键处理流程:
-          1. 权重验证: 检查预训练权重文件有效性并进行分布式安全下载
-          2. 模型创建: 根据配置文件或预训练权重中的配置构建模型
-          3. 参数加载: 智能匹配当前模型与预训练权重的参数结构
-          4. 冻结策略: 按配置冻结指定层数的参数
-          5. EMA初始化: 在主进程创建模型EMA副本
-          6. 训练恢复: 加载优化器状态、EMA状态等训练上下文
-
-        - 核心算法:
-          * 参数剪枝: 通过intersect_dicts实现参数选择性加载
-          * 动态重初始化: 支持剪枝微调时的参数重置
-          * EMA平滑: 通过ModelEMA维护模型参数的移动平均
-
-        - 异常处理:
-          * 无效权重文件会触发check_suffix的断言错误
-          * 参数不匹配时会记录警告而非中断流程
-          * 恢复训练时会验证epoch连续性
-
-        - 性能注意:
-          * 冻结层可减少约15%-20%的训练内存消耗
-          * EMA操作会额外增加约10%的显存占用
-          * 分布式环境下权重下载通过torch_distributed_zero_first保证单进程下载
-
-        示例:
-        >>> cfg = ModelConfig(weights='yolov5s.pt', freeze_layer_num=3)
-        >>> device = torch.device('cuda:0')
-        >>> ckpt = trainer.build_model(cfg, device)
         """
         # 预训练权重处理
         check_suffix(cfg.weights, '.pt')  # 验证文件后缀
-        if pretrained := cfg.weights.endswith('.pt'):
-            with torch_distributed_zero_first(self.LOCAL_RANK):  # 分布式安全下载
-                weights = attempt_download(cfg.weights)
-            ckpt = torch.load(weights, map_location=device)
+
+        if pretrained := (cfg.weights and Path(cfg.weights).exists()):
+            # 直接加载本地权重文件
+            ckpt = torch.load(cfg.weights, map_location=device)
 
             # 模型初始化 (继承预训练模型配置或使用当前配置)
             self.model = Model(cfg or ckpt['model'].yaml).to(device)
 
-            # 参数剪枝与加载
+            # 参数剪裁加载
             exclude = ['anchor'] if cfg.Model.anchors and not cfg.resume else []
             csd = intersect_dicts(ckpt['model'].float().state_dict(),
                                   self.model.state_dict(), exclude=exclude)
 
-            # 剪枝微调特殊处理
-            if cfg.prune_finetune:
-                dynamic_load(self.model, csd, reinitialize=cfg.reinitial)
-                self.model.info() if cfg.reinitial else None
+            # 剪裁微调特殊处理
+            # if cfg.prune_finetune:
+            #     dynamic_load(self.model, csd, reinitialize=cfg.reinitial)
+            #     if cfg.reinitial:
+            #         print("执行动态参数重初始化")
 
             self.model.load_state_dict(csd, strict=False)  # 非严格模式加载
 
@@ -265,28 +222,31 @@ class Trainer:
             ckpt = None
 
         # 参数冻结策略
-        freeze = [f'model.{x}.' for x in range(cfg.freeze_layer_num)]
-        for k, v in self.model.named_parameters():
-            v.requires_grad = not any(x in k for x in freeze)
+        if cfg.freeze_layer_num > 0:
+            freeze = [f'model.{x}.' for x in range(cfg.freeze_layer_num)]
+            for k, v in self.model.named_parameters():
+                if any(x in k for x in freeze):
+                    v.requires_grad = False
 
-        # EMA初始化 (仅主进程)
-        self.ema = ModelEMA(self.model) if self.RANK in [-1, 0] else None
+        # EMA初始化（始终启用）
+        self.ema = ModelEMA(self.model) if pretrained else None # todo 需要修改
 
+        self.start_epoch = 0
         # 训练恢复处理
         if pretrained and not cfg.reinitial:
             # 优化器状态加载
             if ckpt.get('optimizer'):
-                try:  # 兼容不同优化器类型
+                try:
                     self.optimizer.load_state_dict(ckpt['optimizer'])
                 except ValueError:
-                    LOGGER.warning('优化器类型不匹配，重新初始化')
+                    print('优化器类型不匹配，重新初始化')
 
             # EMA状态恢复
             if self.ema and ckpt.get('ema'):
                 try:
                     self.ema.ema.load_state_dict(ckpt['ema'].state_dict())
                 except RuntimeError:
-                    LOGGER.warning('EMA参数不匹配，重新构建')
+                    print('EMA参数不匹配，重新构建')
 
             # 训练周期设置
             self.start_epoch = ckpt['epoch'] + 1
@@ -296,7 +256,7 @@ class Trainer:
             # 微调周期扩展
             self.epochs += ckpt['epoch'] if self.epochs < self.start_epoch else 0
 
-        # 模型元数据记录
+        self.epoch = self.start_epoch
         self.model_type = self.model.model_type
         self.detect = self.model.head
         return ckpt
@@ -413,61 +373,24 @@ class Trainer:
             except ValueError:
                 LOGGER.warning('优化器状态不兼容，进行冷启动')
 
-    def set_env(self, cfg, device, LOCAL_RANK, RANK, WORLD_SIZE, callbacks):
+    def set_env(self, cfg, device):
         """
-        初始化训练环境配置
+        初始化基础训练环境配置
 
-        功能说明:
-        - 设置训练输出目录和文件路径
-        - 初始化分布式训练参数
-        - 配置日志系统和可视化工具
-        - 验证数据集配置完整性
-        - 设置随机种子保证可复现性
+        核心功能:
+        1. 训练输出目录初始化
+        2. 关键配置参数持久化
+        3. 数据集配置完整性验证
+        4. 基础设备设置
+        5. 随机种子设置
 
-        重点细节:
-        - 参数边界条件:
-          * cfg必须包含save_dir、epochs、Dataset等完整配置项
-          * RANK/WORLD_SIZE: 需符合分布式训练规范，单卡训练时RANK=-1
-          * device: 必须与后续训练设备一致
-          * callbacks: 需要实现register_action接口
-
-        - 关键处理流程:
-          1. 路径配置: 创建权重保存目录和最佳模型记录
-          2. 配置持久化: 将运行参数保存为opt.yaml文件
-          3. 日志初始化: 在主进程初始化WandB/TensorBoard等日志工具
-          4. 数据集验证: 检查类别数量与名称的匹配关系
-          5. 随机种子: 保证分布式环境下各进程初始化一致性
-
-        - 核心配置项:
-          * sync_bn: 控制是否使用跨GPU同步的批量归一化
-          * save_period: 模型保存间隔周期数
-          * warmup_epochs: 学习率热身阶段持续时间
-
-        - 异常处理:
-          * 类别数量与名称不匹配时触发AssertionError
-          * 无效设备类型会导致CUDA相关操作失败
-          * 路径创建失败会抛出OSError
-
-        - 性能注意:
-          * WandB日志可能增加约5-10%的训练开销
-          * 同步批量归一化会增加GPU间通信开销
-          * 设置合理的save_period避免频繁IO操作
-
-        示例:
-        >>> cfg = Config(save_dir='runs/exp1', epochs=300, sync_bn=True)
-        >>> device = torch.device('cuda:0')
-        >>> trainer.set_env(cfg, device, LOCAL_RANK=-1, RANK=0, WORLD_SIZE=1, callbacks=Callbacks())
         """
         # 基础参数解包
         self.save_dir = Path(cfg.save_dir)  # 转换为Path对象
         self.epochs = cfg.epochs
         self.batch_size = cfg.Dataset.batch_size
-        self.sync_bn = cfg.sync_bn  # 同步批量归一化开关
 
-        # 分布式参数配置
-        self.LOCAL_RANK = LOCAL_RANK
-        self.RANK = RANK
-        self.WORLD_SIZE = WORLD_SIZE
+        # 设备配置
         self.device = device
         self.cuda = device.type != 'cpu'  # CUDA可用标志
 
@@ -482,15 +405,8 @@ class Trainer:
             with redirect_stdout(f):
                 print(cfg.dump())  # 将配置转储为YAML
 
-        # 日志系统初始化 (仅主进程)
-        if RANK in [-1, 0]:
-            loggers = Loggers(self.save_dir, cfg.weights, cfg, LOGGER)
-            # 注册日志回调方法
-            for logger_method in methods(loggers):
-                callbacks.register_action(logger_method, getattr(loggers, logger_method))
-
-        # 随机种子设置 (保证可复现性)
-        init_seeds(1 + RANK)  # 各进程使用不同种子
+        # 随机种子设置 (固定种子保证可复现性)
+        init_seeds(0)  # 使用固定种子
 
         # 数据集配置验证
         self.data_dict = {
