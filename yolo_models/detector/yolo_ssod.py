@@ -6,9 +6,15 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 from copy import deepcopy
 from pathlib import Path
+
+import torch
+from torch import nn
+
+from yolo_models.backbone.common import DWConv, AutoShape
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -30,7 +36,7 @@ from utils.plots import feature_visualization
 from utils.torch_utils import copy_attr, fuse_conv_and_bn, initialize_weights, model_info, scale_img, \
     select_device, time_sync
 from models.loss.loss import *
-from ..backbone import build_backbone
+from ..backbone import build_backbone, Conv
 from ..neck import build_neck
 from ..head import build_head
 

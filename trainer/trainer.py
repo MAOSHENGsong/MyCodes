@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -84,110 +85,87 @@ class Trainer:
                     f"Logging results to {colorstr('bold', self.save_dir)}\n"
                     f'Starting training for {self.epochs} epochs...')
 
-        # 分布式模型包装 (DDP)
-        self.build_ddp_model(cfg, device)
-
         # 训练控制参数
         self.device = device  # 主计算设备
         self.break_iter = -1  # 迭代中断点 (用于调试)
         self.break_epoch = -1  # 轮次中断点 (用于调试)
 
-
     def build_dataloader(self, cfg, callbacks):
+        # todo 构建新的数据加载系统
         """
-        构建训练和验证数据加载系统
+        构建单机训练和验证数据加载系统
 
         功能说明:
         - 初始化训练集/验证集数据加载器
         - 执行数据预处理配置检查
-        - 实现分布式训练数据划分
-        - 执行数据相关验证(标签范围检查、锚框适配检查)
+        - 实现数据完整性验证(标签范围检查、锚框适配检查)
+        - 支持数据增强与优化策略
 
-        重点细节:
-        - 参数边界条件:
-          * cfg.Dataset必须包含img_size、workers、data_name等配置项
-          * cfg.hyp需包含数据增强相关参数(use_aug, anchor_t等)
-          * callbacks需要实现on_pretrain_routine_end回调接口
-
-        - 关键处理流程:
-          1. 图像尺寸对齐: 确保输入尺寸是模型stride的整数倍
-          2. 并行模式选择: 根据硬件条件选择DP/DDP模式
-          3. 数据加载优化: 根据配置启用数据缓存、矩形训练等优化
-          4. 数据完整性验证: 检查标签类别最大值是否超出配置
-          5. 辅助功能: 标签统计可视化、锚框自动优化
-
-        - 核心算法:
-          * SyncBatchNorm: 多GPU训练时同步批量归一化统计量
-          * 自动锚框调整: 基于k-means算法适配数据集锚框
-          * 矩形训练: 根据图像宽高比分组优化填充策略
-
-        - 异常处理:
-          * 当检测到标签类别超过nc时抛出AssertionError
-          * 无效的图像尺寸会触发check_img_size的异常
-          * 数据加载失败时会通过create_dataloader抛出异常
-
-        - 性能注意:
-          * 推荐使用rect=True减少填充像素提升训练速度
-          * 缓存策略(cache参数)可显著加速但需要充足内存
-          * 多GPU训练时batch_size会自动除以WORLD_SIZE
-
-        示例:
-        >>> trainer = Trainer(...)
-        >>> trainer.build_dataloader(cfg, callbacks)
+        参数边界条件:
+          * cfg.Dataset必须包含img_size、workers等配置项
+          * cfg.hyp需包含数据增强相关参数
+          * callbacks需要实现预训练结束回调接口
         """
-        # 图像尺寸对齐模型stride要求
-        gs = max(int(self.model.stride.max()), 32)  # 计算网格基准尺寸
-        self.imgsz = check_img_size(cfg.Dataset.img_size, gs, floor=gs * 2)  # 尺寸校验
+        # 图像尺寸对齐模型要求
+        model_stride = int(self.model.stride.max())
+        gs = max(model_stride, 32)  # 计算最小网格基准尺寸
+        self.imgsz = check_img_size(cfg.Dataset.img_size, gs, floor=gs * 2)  # 校验并调整输入尺寸
 
-        # 并行模式选择与警告
-        if self.cuda and self.RANK == -1 and torch.cuda.device_count() > 1:
-            logging.warning('建议使用DDP替代DP模式以获得更好多GPU性能')
-            self.model = torch.nn.DataParallel(self.model)
-
-        # 同步批量归一化配置
-        if self.sync_bn and self.cuda and self.RANK != -1:
-            self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model).to(self.device)
-            LOGGER.info('已启用跨GPU批量归一化同步')
+        # 数据加载器核心参数配置
+        batch_size = cfg.batch_size  # 使用完整批次大小
+        workers = cfg.Dataset.workers or os.cpu_count()  # 自动获取CPU核心数
 
         # 训练数据加载器初始化
         self.train_loader, self.dataset = create_dataloader(
-            path=self.data_dict['train'],
+            path=self.data_dict['train'],  # 训练集路径
             imgsz=self.imgsz,
-            batch_size=self.batch_size // self.WORLD_SIZE,  # 分布式数据划分
-            stride=gs,
-            single_cls=self.single_cls,
-            hyp=cfg.hyp,
-            augment=cfg.hyp.use_aug,
-            cache=cfg.cache,
-            rect=cfg.rect,
-            rank=self.LOCAL_RANK,
-            workers=cfg.Dataset.workers,
-            cfg=cfg
+            batch_size=batch_size,  # 单机模式使用完整批次
+            stride=model_stride,
+            single_cls=cfg.single_cls,  # 单类别模式
+            hyp=cfg.hyp,  # 超参数配置
+            augment=cfg.hyp.use_aug,  # 数据增强开关
+            cache=cfg.cache,  # 数据缓存策略
+            rect=cfg.rect,  # 矩形训练优化
+            workers=min(workers, 64)  # 限制最大工作进程数
         )
 
         # 标签完整性验证
-        mlc = int(np.concatenate(self.dataset.labels, 0)[:, 0].max())  # 最大类别索引
-        assert mlc < self.nc, f'检测到无效标签类别{mlc} (允许范围0-{self.nc - 1})'
+        max_label_class = int(np.concatenate(self.dataset.labels, 0)[:, 0].max())
+        if max_label_class >= self.nc:
+            raise ValueError(f'检测到无效标签类别{max_label_class} (允许范围0-{self.nc - 1})')
 
-        # 主进程验证数据初始化
-        if self.RANK in [-1, 0]:
-            self.val_loader = create_dataloader(...)[0]  # 验证集加载器
+        # 验证集数据加载器
+        self.val_loader = create_dataloader(
+            path=self.data_dict['val'],
+            imgsz=self.imgsz,
+            batch_size=batch_size * 2,  # 验证批次通常更大
+            stride=model_stride,
+            single_cls=cfg.single_cls,
+            hyp=cfg.hyp,
+            augment=False,  # 验证阶段不增强
+            cache=cfg.cache
+        )[0]
 
-            if not cfg.resume:
-                # 初始化阶段数据验证
+        # 初始化阶段数据分析
+        if not cfg.resume:
+            # 标签分布可视化
+            if self.plots:
                 labels = np.concatenate(self.dataset.labels, 0)
-                if self.plots:
-                    plot_labels(labels, self.names, self.save_dir)  # 标签分布可视化
+                plot_labels(labels, self.names, self.save_dir)
 
-                # 自动锚框优化
-                if not cfg.noautoanchor:
-                    check_anchors(self.dataset, model=self.model, thr=cfg.hyp.anchor_t, imgsz=self.imgsz)
+            # 自动锚框优化
+            if cfg.autoanchor:
+                check_anchors(self.dataset,
+                              model=self.model,
+                              thr=cfg.hyp.anchor_t,  # 匹配阈值
+                              imgsz=self.imgsz)
 
-                self.model.half().float()  # 精度转换保持锚框稳定性
+            # 模型精度稳定性处理
+            self.model.half().float()
 
-            callbacks.run('on_pretrain_routine_end')  # 预训练准备完成回调
-
-        self.no_aug_epochs = cfg.hyp.no_aug_epochs  # 配置后期禁用数据增强
+        # 配置后期训练优化
+        self.no_aug_epochs = cfg.hyp.no_aug_epochs  # 最后N个epoch关闭数据增强
+        callbacks.run('on_pretrain_routine_end')  # 触发预训练完成回调
 
     def build_model(self, cfg, device):
         """
@@ -264,56 +242,11 @@ class Trainer:
     def build_optimizer(self, cfg, optinit=True, weight_masks=None, ckpt=None):
         """
         构建优化器与学习率调度系统
-
-        功能说明:
-        - 初始化优化器并配置参数分组策略
-        - 实现学习率调度策略(线性/余弦退火)
-        - 支持自定义优化器(RepOptimizer)
-        - 处理梯度累积与权重衰减的自动缩放
-        - 支持训练恢复时的状态加载
-
-        重点细节:
-        - 参数边界条件:
-          * cfg.hyp必须包含lr0/lrf/momentum等超参数
-          * cfg.Model.RepOpt开启时需要提供RepScale_weight参数文件
-          * weight_masks需与模型参数结构匹配(当使用参数掩码时)
-
-        - 关键处理流程:
-          1. 梯度累积计算: 根据名义批量与实际批量自动计算累积步数
-          2. 权重衰减调整: 根据实际批量动态缩放正则化强度
-          3. 参数智能分组: 区分普通权重/BN层参数/偏置参数
-          4. 优化器选择: 支持AdamW/SGD/RepOptimizer三种模式
-          5. 学习率调度: 配置线性衰减或单周期余弦退火策略
-
-        - 核心算法:
-          * 参数分组优化: 对BN层参数取消权重衰减
-          * 动态权重衰减: weight_decay = base_decay * (batch_size * accumulate / nbs)
-          * RepOptimizer: 针对结构重参数化模型的特殊优化器
-
-        - 异常处理:
-          * 使用RepOptimizer时若未提供缩放权重文件会触发AssertionError
-          * 优化器状态加载失败时会记录警告而非中断流程
-          * 参数分组失败会通过LOGGER输出诊断信息
-
-        - 性能注意:
-          * 梯度累积可降低小显存设备的显存需求
-          * BN层参数不进行权重衰减可提升模型稳定性
-          * 自动混合精度(scaler)可减少显存占用并加速训练
-          * RepOptimizer需配合特定模型结构使用
-
-        示例:
-        >>> # 标准SGD优化器配置
-        >>> cfg = ModelConfig(adam=False, hyp=HyperParams(lr0=0.01, lrf=0.2))
-        >>> trainer.build_optimizer(cfg)
-        >>>
-        >>> # RepOptimizer配置
-        >>> cfg = ModelConfig(RepOpt=True, RepScale_weight='scales.pt')
-        >>> trainer.build_optimizer(cfg)
         """
         # 梯度累积与权重衰减计算
         nbs = 64  # 名义批量基准值
         self.accumulate = max(round(nbs / self.batch_size), 1)  # 自动计算累积步数
-        weight_decay = cfg.hyp.weight_decay * self.batch_size * self.accumulate / nbs  # 动态缩放正则化强度
+        weight_decay = cfg.hyp.weight_decay * self.batch_size * self.accumulate / nbs
         LOGGER.info(f"自适应权重衰减系数: {weight_decay:.5f}")
 
         # 参数智能分组 (权重/BN参数/偏置)
@@ -326,31 +259,15 @@ class Trainer:
             elif hasattr(module, 'weight') and isinstance(module.weight, nn.Parameter):
                 g_w.append(module.weight)  # 普通权重(带衰减)
 
-        # 优化器初始化
-        if not cfg.Model.RepOpt:  # 标准优化器
-            if cfg.adam:
-                self.optimizer = AdamW(g_b, lr=cfg.hyp.lr0, betas=(cfg.hyp.momentum, 0.999))
-            else:
-                self.optimizer = SGD(g_b, lr=cfg.hyp.lr0, momentum=cfg.hyp.momentum, nesterov=True)
-            # 添加参数组(带不同超参数)
-            self.optimizer.add_param_group({'params': g_w, 'weight_decay': weight_decay})
-            self.optimizer.add_param_group({'params': g_bnw})
-        else:  # 结构重参数优化器
-            from yolo_models.optimizers import RepVGGOptimizer
-            assert cfg.Model.RepScale_weight, "RepOptimizer需要指定缩放权重文件"
-            scales = self.opt_scales or torch.load(cfg.Model.RepScale_weight, self.device)
-            params_groups = [
-                {'params': g_bnw},  # BN参数组
-                {'params': g_w, 'weight_decay': weight_decay},  # 带衰减权重
-                {'params': g_b}  # 偏置参数
-            ]
-            # 初始化模式判断(新训练或微调)
-            reinit = cfg.weights == '' and optinit
-            self.optimizer = RepVGGOptimizer(
-                self.model, scales, cfg,
-                reinit=reinit, device=self.device,
-                params=params_groups, weight_masks=weight_masks
-            )
+        # 标准优化器初始化
+        if cfg.adam:
+            self.optimizer = AdamW(g_b, lr=cfg.hyp.lr0, betas=(cfg.hyp.momentum, 0.999))
+        else:
+            self.optimizer = SGD(g_b, lr=cfg.hyp.lr0, momentum=cfg.hyp.momentum, nesterov=True)
+
+        # 添加参数组（带不同超参数）
+        self.optimizer.add_param_group({'params': g_w, 'weight_decay': weight_decay})
+        self.optimizer.add_param_group({'params': g_bnw})
 
         # 优化器信息日志
         LOGGER.info(f"{colorstr('优化器:')} {type(self.optimizer).__name__} "
@@ -570,50 +487,49 @@ class Trainer:
         更新训练日志表头并打印格式
 
         功能说明:
-        - 通过预遍历获取损失项名称
-        - 动态扩展日志表头字段
+        - 通过预遍历首个训练batch获取损失项名称
+        - 动态构建日志表头字段
         - 输出标准化的日志格式
 
         重点细节:
-        - 仅处理首个训练batch用于元数据采集
+        - 仅处理训练加载器的首个批次
         - 自动识别损失字典的键作为日志字段
-        - 使用LOGGER输出固定宽度的表头格式
+        - 使用固定宽度格式保证对齐
 
         核心算法:
-        - 非阻塞数据加载(non_blocking=True)优化传输
+        - 非阻塞数据加载(non_blocking=True)优化传输效率
         - 自动混合精度上下文管理(autocast)
-        - 分布式训练主进程判定(RANK in [-1, 0])
+        - 基于首个batch的元数据采集机制
 
         异常处理:
-        - 空训练加载器将导致无限阻塞
+        - 空训练加载器将导致阻塞等待
         - 设备不匹配会引发RuntimeError
-        - 无效的损失计算会中断预处理
+        - 无效的损失计算会中断预处理流程
 
         性能注意:
-        - 预遍历单个batch增加约3-5%的初始化耗时
-        - 混合精度可减少显存占用约30%
-        - 建议在首个epoch开始前执行
+        - 预遍历单个batch增加约3-5%初始化耗时
+        - 混合精度可减少约30%显存占用
+        - 建议在训练循环开始前执行
 
         示例:
-        >>> trainer.build_train_logger()
         >>> trainer.update_train_logger()
         [INFO]     Epoch   gpu_mem    labels  img_size       loss       box       obj       cls
         """
-        # 预遍历获取损失项名称
+        # 预遍历首个训练批次获取损失项
         for (imgs, targets, paths, _) in self.train_loader:
+            # 设备数据传输优化
             imgs = imgs.to(self.device, non_blocking=True).float() / self.norm_scale
 
-            # 自动混合精度前向计算
+            # 混合精度前向计算
             with amp.autocast(enabled=self.cuda):
                 pred = self.model(imgs)
                 _, loss_items = self.compute_loss(pred, targets.to(self.device))
 
-            # 主进程构建日志表头
-            if self.RANK in [-1, 0]:
-                self.log_contents += loss_items.keys()
+            # 构建日志字段（单卡模式直接处理）
+            self.log_contents += loss_items.keys()
             break  # 仅处理首个batch
 
-        # 输出格式化表头
+        # 生成固定宽度表头格式
         header_format = '\n' + '%10s' * len(self.log_contents)
         LOGGER.info(header_format % tuple(self.log_contents))
 
@@ -626,7 +542,7 @@ class Trainer:
         - 管理训练模式/数据增强策略/损失函数调整
         - 初始化训练指标跟踪系统
         - 处理学习率热身阶段设置
-        - 分布式训练数据采样控制
+
 
         重点细节:
         - 参数边界条件:
@@ -639,7 +555,7 @@ class Trainer:
           2. 训练日志系统重建
           3. 后期训练阶段优化策略调整
           4. 热身迭代次数计算
-          5. 分布式数据采样控制
+
 
         - 核心配置项:
           * mosaic增强: 默认开启，最后no_aug_epochs阶段关闭
@@ -649,7 +565,7 @@ class Trainer:
         - 异常处理:
           * 无效的no_aug_epochs配置会导致增强策略错误
           * 不支持的model_type不会触发L1损失调整
-          * 分布式环境错误会中断训练流程
+
 
         - 性能注意:
           * 关闭mosaic可提升约15%的训练速度
@@ -676,10 +592,6 @@ class Trainer:
             LOGGER.info("关闭Mosaic数据增强")
             self.dataset.mosaic = False  # 禁用mosaic增强
 
-            # YOLOX特定优化
-            LOGGER.info("启用L1正则损失")
-            if self.model_type == 'yolox':
-                self.detect.use_l1 = True  # 检测头启用L1损失
 
         # 指标跟踪重置
         self.meter = MetricMeter()  # 新建指标计量器
@@ -692,9 +604,6 @@ class Trainer:
         else:
             self.nw = -1  # 禁用热身
 
-        # 分布式数据采样控制
-        if self.RANK != -1:
-            self.train_loader.sampler.set_epoch(self.epoch)  # 设置采样epoch保证shuffle差异
 
     def update_optimizer(self, loss, ni):
         """
@@ -791,49 +700,37 @@ class Trainer:
         功能说明:
         - 管理完整的前向传播、损失计算、反向传播流程
         - 实现训练进度可视化与指标记录
-        - 处理混合精度训练与分布式梯度同步
+        - 支持混合精度训练与设备优化
         - 触发训练批次结束回调函数
         - 更新学习率调度器
 
         重点细节:
         - 参数边界条件:
-          * callbacks: 需实现on_train_batch_end接口
-          * RANK: 分布式训练时需正确设置进程编号
-          * break_iter: 调试用断点设置需小于总批次数nb
+            * callbacks: 需实现on_train_batch_end接口
+            * break_iter: 调试用断点设置需小于总批次数nb
 
         - 关键处理流程:
-          1. 进度条初始化与分布式进程控制
-          2. 数据预处理与设备转移优化
-          3. 混合精度前向计算与损失缩放
-          4. 分布式环境下的梯度平均
-          5. 实时训练指标可视化
-          6. 学习率调度器步进
+            1. 进度条初始化与设备数据预处理
+            2. 混合精度前向计算与损失缩放
+            3. 实时训练指标可视化
+            4. 学习率调度器步进
 
         - 核心算法:
-          * 自动混合精度: 通过autocast上下文管理
-          * 梯度平均: DDP模式下梯度自动平均
-          * 动态进度条: 实时显示显存/损失/处理速度等指标
+            * 自动混合精度: 通过autocast上下文管理
+            * 动态进度条: 实时显示显存/损失/处理速度等指标
 
-        - 异常处理:
-          * 无效的callbacks会静默失败
-          * 显存不足会触发CUDA out of memory错误
-          * 数据格式错误会中断当前批次处理
-
-        - 性能注意:
-          * non_blocking=True异步传输可提升约5%速度
-          * 混合精度减少约30%显存消耗
-          * 进度条更新频率影响训练速度
+        - 性能优化:
+            * non_blocking=True异步传输提升数据加载速度
+            * 混合精度减少约30%显存消耗
+            * 梯度累积需配合optimizer_step参数使用
 
         示例:
         >>> callbacks = TrainingCallbacks()
         >>> trainer.train_in_epoch(callbacks)
         0/299      3.2G        64       640      0.1234      0.5678      0.9012  # 进度条示例
         """
-        # 进度条初始化 (仅主进程显示)
-        pbar = enumerate(self.train_loader)
-        if self.RANK in [-1, 0]:
-            pbar = tqdm(pbar, total=self.nb, desc=f'Epoch {self.epoch}')
-
+        # 初始化进度条（单卡训练模式）
+        pbar = tqdm(enumerate(self.train_loader), total=self.nb, desc=f'Epoch {self.epoch}')
         self.optimizer.zero_grad()  # 清空历史梯度
 
         # 批次训练循环
@@ -844,42 +741,33 @@ class Trainer:
             # 元数据计算
             ni = i + self.nb * self.epoch  # 全局迭代次数
 
-            # 数据预处理 (非阻塞传输+归一化)
+            # 数据预处理（非阻塞传输+归一化优化）
             imgs = imgs.to(self.device, non_blocking=True).float() / self.norm_scale
 
-            # 前向传播 (混合精度上下文)
+            # 前向传播（混合精度上下文）
             with amp.autocast(enabled=self.cuda):
                 pred = self.model(imgs)  # 模型推理
                 loss, loss_items = self.compute_loss(pred, targets.to(self.device))  # 损失计算
 
-                # DDP模式梯度平均 (自动AllReduce)
-                if self.RANK != -1:
-                    loss *= self.WORLD_SIZE  # 梯度按设备数缩放
-
             # 优化器参数更新
             self.update_optimizer(loss, ni)
 
-            # 主进程日志记录
-            if self.RANK in [-1, 0]:
-                # 指标聚合
-                self.meter.update(loss_items)
+            # 实时指标监控
+            self.meter.update(loss_items)
+            mem = f'{torch.cuda.memory_reserved() / 1E9:.3g}G' if torch.cuda.is_available() else '0G'
 
-                # 显存监控
-                mem = f'{torch.cuda.memory_reserved() / 1E9:.3g}G' if torch.cuda.is_available() else '0G'
+            # 动态进度条格式: Epoch | 显存 | 目标数 | 图像尺寸 | 各项损失
+            pbar.set_description((
+                f'{self.epoch:>3}/{self.epochs - 1:>3} '
+                f'{mem:>8} '
+                f'{targets.shape[0]:>6} '
+                f'{imgs.shape[-1]:>6} '
+                f'{" ".join(f"{v:.4f}" for v in self.meter.get_avg())}'
+            ))
 
-                # 进度条格式: Epoch | 显存 | 目标数 | 图像尺寸 | 各项损失
-                pbar.set_description((
-                    f'{self.epoch:>3}/{self.epochs - 1:>3} '
-                    f'{mem:>8} '
-                    f'{targets.shape[0]:>6} '
-                    f'{imgs.shape[-1]:>6} '
-                    f'{" ".join(f"{v:.4f}" for v in self.meter.get_avg())}'
-                ))
-
-                # 触发批次结束回调
-                callbacks.run('on_train_batch_end', ni, self.model,
-                              imgs, targets, paths, self.plots,
-                              self.sync_bn, self.cfg.Dataset.np)
+            # 触发批次结束回调
+            callbacks.run('on_train_batch_end', ni, self.model,
+                          imgs, targets, paths, self.plots, self.cfg.Dataset.np)
 
         # 学习率调度器更新
         self.lr = [x['lr'] for x in self.optimizer.param_groups]  # 记录当前学习率
@@ -1061,9 +949,9 @@ class Trainer:
         results = self.after_train(callbacks, val)  # 最终验证与清理
 
         # 训练总结报告
-        if self.RANK in [-1, 0]:
-            duration = (time.time() - t0) / 3600  # 计算总耗时(小时)
-            epochs_done = self.epoch - self.start_epoch + 1
-            LOGGER.info(f'\n完成{epochs_done}个训练周期，总耗时{duration:.3f}小时')
+        # if self.RANK in [-1, 0]:
+        #     duration = (time.time() - t0) / 3600  # 计算总耗时(小时)
+        #     epochs_done = self.epoch - self.start_epoch + 1
+        #     LOGGER.info(f'\n完成{epochs_done}个训练周期，总耗时{duration:.3f}小时')
 
         return results  # 返回最终验证指标

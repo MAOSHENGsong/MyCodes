@@ -73,8 +73,8 @@ class Model(nn.Module):
             # 计算实际步长 = 输入尺寸 / 特征图尺寸
             self.stride = torch.Tensor([s / x.shape[-2] for x in feature_shapes])
 
-        # 初始化检测层偏置参数（YOLOv11专用初始化逻辑）
-        m.initialize_biases(self.stride)  # 传入步长参数用于自适应初始化
+        # 初始化检测层偏置参数
+        m.bias_init()
 
 
     def forward(self, x):
